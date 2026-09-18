@@ -34,6 +34,12 @@
         <span :class="$vuetify.breakpoint.smAndDown ? 'text-200p' : 'text-300p'">{{ $vuetify.lang.t('$vuetify.gooboo.newGame') }}</span>
       </v-btn>
     </div>
+    <div class="text-center">
+      <v-btn text color="primary" @click="restoreFromCloud" :loading="cloudLoading">
+        <v-icon left>mdi-cloud-download</v-icon>
+        从云存档恢复
+      </v-btn>
+    </div>
     <div class="text-center" :class="$vuetify.breakpoint.smAndDown ? '' : 'text-150p'">
       <span>{{ $vuetify.lang.t('$vuetify.gooboo.playedBefore.0') }}</span>
       <label for="gooboo-savefile-input"><a>{{ $vuetify.lang.t('$vuetify.gooboo.playedBefore.1') }}</a></label>
@@ -43,14 +49,37 @@
 
 <script>
 import SettingItem from '../partial/settings/Item.vue';
+import { getCloudToken, restoreCloudSave, setCloudToken } from '../../js/cloudSave';
 
 export default {
   components: { SettingItem },
+  data: () => ({
+    cloudLoading: false
+  }),
   methods: {
     startNewGame() {
       this.$store.dispatch('system/updateSetting', {category: 'general', name: 'pause', value: false});
       this.$store.commit('system/resetAutosaveTimer');
       this.$store.commit('system/updateKey', {key: 'screen', value: 'mining'});
+    },
+    async restoreFromCloud() {
+      let token = getCloudToken();
+      if (!token) {
+        token = window.prompt('请输入 Cloudflare Worker 中配置的 SYNC_TOKEN：');
+        if (token === null || token.trim() === '') {
+          return;
+        }
+        setCloudToken(token.trim());
+      }
+
+      this.cloudLoading = true;
+      try {
+        await restoreCloudSave();
+      } catch (error) {
+        window.alert('云存档恢复失败：' + error.message);
+      } finally {
+        this.cloudLoading = false;
+      }
     }
   }
 }

@@ -18,7 +18,8 @@ export {
     setCloudToken,
     startCloudSync,
     stopCloudSync,
-    syncCloudSave
+    syncCloudSave,
+    restoreCloudSave
 };
 
 function getCloudToken() {
@@ -132,6 +133,25 @@ function useCloudSave(cloud) {
     localStorage.setItem(LOCAL_STORAGE_NAME, cloud.saveData);
     setCloudRevision(cloud.revision);
     window.location.reload();
+}
+
+async function restoreCloudSave() {
+    if (!getCloudToken()) {
+        throw new Error("请先输入 SYNC_TOKEN");
+    }
+
+    const cloud = await getCloudSave();
+    if (!cloud.exists || !cloud.saveData) {
+        throw new Error("云端还没有存档");
+    }
+
+    const cloudInfo = getSaveInfo(cloud.saveData);
+    if (!cloudInfo) {
+        throw new Error("云端存档内容无效");
+    }
+
+    useCloudSave(cloud);
+    return {status: "downloaded", revision: cloud.revision};
 }
 
 async function performSync({interactive = false} = {}) {
