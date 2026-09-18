@@ -482,6 +482,14 @@
               <v-list-item-title>{{ $vuetify.lang.t('$vuetify.gooboo.saveImport') }}</v-list-item-title>
             </v-list-item>
           </label>
+          <v-divider></v-divider>
+          <v-list-item @click="configureCloudSync">
+            <v-list-item-title>云存档设置{{ cloudConfigured ? '（已启用）' : '（未配置）' }}</v-list-item-title>
+          </v-list-item>
+          <v-list-item v-if="cloudConfigured" @click="cloudSyncNow">
+            <v-list-item-title>立即同步云存档</v-list-item-title>
+          </v-list-item>
+          <v-divider></v-divider>
           <v-list-item @click="changeScreen('resetProgress')">
             <v-list-item-title>{{ $vuetify.lang.t('$vuetify.gooboo.resetProgress') }}</v-list-item-title>
           </v-list-item>
@@ -593,6 +601,7 @@ import UpdateMessage from './components/partial/snackbar/UpdateMessage.vue';
 import { APP_ENV, APP_TESTING } from './js/constants';
 import ImportMessage from './components/partial/snackbar/ImportMessage.vue';
 import UnlockMessage from './components/partial/snackbar/UnlockMessage.vue';
+import { clearCloudToken, getCloudToken, setCloudToken, startCloudSync, stopCloudSync, syncCloudSave } from './js/cloudSave';
 const semverCompare = require('semver/functions/compare');
 
 export default {
@@ -644,7 +653,8 @@ export default {
   },
   data: () => ({
     dialogDust: false,
-    intervalId: null
+    intervalId: null,
+    cloudConfigured: !!getCloudToken()
   }),
   computed: {
     ...mapState({
@@ -756,6 +766,10 @@ export default {
     if (this.updateCheckValue && this.canSeeUpdates) {
       this.intervalStart();
     }
+    startCloudSync();
+  },
+  beforeDestroy() {
+    stopCloudSync();
   },
   methods: {
     localSave() {
@@ -765,6 +779,48 @@ export default {
     exportSave() {
       this.$store.commit('system/updateKey', {key: 'backupTimer', value: 0});
       exportFile();
+    },
+    async configureCloudSync() {
+      const currentToken = getCloudToken();
+      const message = currentToken ?
+        '云同步已配置。输入新的 SYNC_TOKEN 可替换；输入 DELETE 可关闭云同步；留空保持不变。' :
+        '请输入 Cloudflare Worker 中配置的 SYNC_TOKEN：';
+      const token = window.prompt(message);
+      if (token === null || token.trim() === '') {
+        return;
+      }
+      if (token.trim().toUpperCase() === 'DELETE') {
+        clearCloudToken();
+        stopCloudSync();
+        this.cloudConfigured = false;
+        window.alert('已关闭此设备的云存档同步。本地存档不会删除。');
+        return;
+      }
+      setCloudToken(token.trim());
+      this.cloudConfigured = true;
+      stopCloudSync();
+      startCloudSync(false);
+      await this.cloudSyncNow();
+    },
+    async cloudSyncNow() {
+      try {
+        const result = await syncCloudSave({interactive: true});
+        if (result.status === 'created') {
+          window.alert('云存档已创建，并已上传当前进度。');
+        } else if (result.status === 'uploaded') {
+          window.alert('云存档同步成功。');
+        } else if (result.status === 'up-to-date') {
+          window.alert('本地与云端已经是同一进度。');
+        } else if (result.status === 'different-save') {
+          window.alert('检测到不同角色的存档，本次没有覆盖任何数据。');
+        } else if (result.status === 'conflict') {
+          window.alert('检测到其他设备更新了云存档，本次没有覆盖。请稍后再点一次“立即同步云存档”。');
+        } else if (result.status === 'disabled') {
+          window.alert('请先配置云存档 SYNC_TOKEN。');
+        }
+      } catch (error) {
+        window.alert('云存档同步失败：' + error.message);
+      }
     },
     importSave() {
       let file = document.getElementById('gooboo-savefile-input').files[0];
