@@ -2,6 +2,8 @@ import store from "../store";
 import { decodeFile, getSavefile, saveLocal } from "./savefile";
 import { LOCAL_STORAGE_NAME } from "./constants";
 
+const semverCompare = require("semver/functions/compare");
+
 const CLOUD_SAVE_URL = "https://gooboo-save.shuai-develop.workers.dev/save";
 const CLOUD_TOKEN_STORAGE_NAME = "goobooCloudToken";
 const CLOUD_REVISION_STORAGE_NAME = "goobooCloudRevision";
@@ -11,6 +13,7 @@ const CLOUD_REQUEST_TIMEOUT = 8000;
 
 let cloudSyncTimer = null;
 let activeSync = null;
+let visibilityHandler = null;
 
 export {
     clearCloudToken,
@@ -19,7 +22,8 @@ export {
     startCloudSync,
     stopCloudSync,
     syncCloudSave,
-    restoreCloudSave
+    restoreCloudSave,
+    resolveStartupSave
 };
 
 function getCloudToken() {
@@ -54,6 +58,61 @@ function setCloudRevision(revision) {
 
 function getSaveInfo(saveData) {
     return decodeFile(saveData, false);
+}
+
+function getRawSaveInfo(saveData) {
+    if (!saveData || typeof saveData !== "string") {
+        return null;
+    }
+
+    let raw = saveData;
+    if (raw.charAt(0) !== "{") {
+        try {
+            raw = atob(raw);
+        } catch {
+            return null;
+        }
+    }
+
+    try {
+        const parsed = JSON.parse(raw);
+        return {
+            version: parsed.version ?? null,
+            timestamp: Number(parsed.timestamp || 0),
+            playerId: parsed.playerId ?? null
+        };
+    } catch {
+        return null;
+    }
+}
+
+function checkCloudVersion(cloudInfo) {
+    if (!cloudInfo?.version) {
+        return {ok: true};
+    }
+
+    try {
+        if (semverCompare(cloudInfo.version, store.state.system.version) === 1) {
+            const refreshKey = "goobooCloudRefreshVersion";
+            if (sessionStorage.getItem(refreshKey) !== cloudInfo.version) {
+                sessionStorage.setItem(refreshKey, cloudInfo.version);
+                const url = new URL(window.location.href);
+                url.searchParams.set("_cloud_update", Date.now().toString());
+                window.location.replace(url.toString());
+                return {ok: false, reload: true};
+            }
+            return {
+                ok: false,
+                blocked: true,
+                message: `云存档版本为 ${cloudInfo.version}，当前页面版本为 ${store.state.system.version}。请强制刷新页面后再继续，当前设备不会覆盖云存档。`
+            };
+        }
+    } catch {
+        // Ignore malformed version strings and let the normal save validation handle them.
+    }
+
+    sessionStorage.removeItem("goobooCloudRefreshVersion");
+    return {ok: true};
 }
 
 async function cloudRequest(method, body = null) {
@@ -145,6 +204,19 @@ async function restoreCloudSave() {
         throw new Error("云端还没有存档");
     }
 
+    const rawCloudInfo = getRawSaveInfo(cloud.saveData);
+    if (!rawCloudInfo) {
+        throw new Error("云端存档内容无效");
+    }
+
+    const versionCheck = checkCloudVersion(rawCloudInfo);
+    if (versionCheck.reload) {
+        return {status: "reloading"};
+    }
+    if (versionCheck.blocked) {
+        throw new Error(versionCheck.message);
+    }
+
     const cloudInfo = getSaveInfo(cloud.saveData);
     if (!cloudInfo) {
         throw new Error("云端存档内容无效");
@@ -152,6 +224,57 @@ async function restoreCloudSave() {
 
     useCloudSave(cloud);
     return {status: "downloaded", revision: cloud.revision};
+}
+
+async function resolveStartupSave(localSave) {
+    if (!getCloudToken()) {
+        return {saveData: localSave, source: "local"};
+    }
+
+    let cloud;
+    try {
+        cloud = await getCloudSave();
+    } catch {
+        return {saveData: localSave, source: "local", cloudUnavailable: true};
+    }
+
+    if (!cloud.exists || !cloud.saveData) {
+        return {saveData: localSave, source: "local"};
+    }
+
+    const cloudInfo = getRawSaveInfo(cloud.saveData);
+    if (!cloudInfo) {
+        return {saveData: localSave, source: "local"};
+    }
+
+    const versionCheck = checkCloudVersion(cloudInfo);
+    if (versionCheck.reload) {
+        return {reload: true};
+    }
+    if (versionCheck.blocked) {
+        return {blocked: true, message: versionCheck.message};
+    }
+
+    setCloudRevision(cloud.revision);
+
+    if (!localSave) {
+        localStorage.setItem(LOCAL_STORAGE_NAME, cloud.saveData);
+        return {saveData: cloud.saveData, source: "cloud"};
+    }
+
+    const localInfo = getRawSaveInfo(localSave);
+    if (!localInfo) {
+        localStorage.setItem(LOCAL_STORAGE_NAME, cloud.saveData);
+        return {saveData: cloud.saveData, source: "cloud"};
+    }
+
+    const samePlayer = !localInfo.playerId || !cloudInfo.playerId || localInfo.playerId === cloudInfo.playerId;
+    if (samePlayer && cloudInfo.timestamp > localInfo.timestamp) {
+        localStorage.setItem(LOCAL_STORAGE_NAME, cloud.saveData);
+        return {saveData: cloud.saveData, source: "cloud"};
+    }
+
+    return {saveData: localSave, source: "local"};
 }
 
 async function performSync({interactive = false} = {}) {
@@ -162,16 +285,17 @@ async function performSync({interactive = false} = {}) {
         return {status: "skipped"};
     }
 
-    saveLocal();
-    const localSave = getSavefile();
-    const localInfo = getSaveInfo(localSave);
-    if (!localInfo) {
-        throw new Error("无法读取当前本地存档");
-    }
+    // Compare the persisted local save before advancing/saving the current runtime state.
+    // This prevents an occasionally-used stale phone from becoming "newer" only because
+    // Gooboo calculated offline progress up to the current time.
+    const persistedLocalSave = localStorage.getItem(LOCAL_STORAGE_NAME);
+    const persistedLocalInfo = getRawSaveInfo(persistedLocalSave);
 
     const cloud = await getCloudSave();
 
     if (!cloud.exists) {
+        saveLocal();
+        const localSave = getSavefile();
         const uploaded = await putCloudSave(localSave, 0);
         if (uploaded.conflict) {
             return {status: "conflict"};
@@ -180,7 +304,38 @@ async function performSync({interactive = false} = {}) {
         return {status: "created", revision: uploaded.revision};
     }
 
+    const rawCloudInfo = getRawSaveInfo(cloud.saveData);
+    if (!rawCloudInfo) {
+        throw new Error("云端存档内容无效");
+    }
+
+    const versionCheck = checkCloudVersion(rawCloudInfo);
+    if (versionCheck.reload) {
+        return {status: "reloading"};
+    }
+    if (versionCheck.blocked) {
+        throw new Error(versionCheck.message);
+    }
+
     setCloudRevision(cloud.revision);
+
+    // On the first sync after opening a device, the cloud wins when the persisted
+    // browser save is older. Do this before saveLocal() updates the runtime timestamp.
+    if (
+        persistedLocalInfo &&
+        (!persistedLocalInfo.playerId || !rawCloudInfo.playerId || persistedLocalInfo.playerId === rawCloudInfo.playerId) &&
+        rawCloudInfo.timestamp > persistedLocalInfo.timestamp
+    ) {
+        useCloudSave(cloud);
+        return {status: "downloaded"};
+    }
+
+    saveLocal();
+    const localSave = getSavefile();
+    const localInfo = getSaveInfo(localSave);
+    if (!localInfo) {
+        throw new Error("无法读取当前本地存档");
+    }
 
     const cloudInfo = getSaveInfo(cloud.saveData);
     if (!cloudInfo) {
@@ -243,6 +398,15 @@ function startCloudSync(syncImmediately = true) {
         }, CLOUD_SYNC_INTERVAL);
     }
 
+    if (visibilityHandler === null) {
+        visibilityHandler = () => {
+            if (document.visibilityState === "hidden") {
+                syncCloudSave().catch(() => {});
+            }
+        };
+        document.addEventListener("visibilitychange", visibilityHandler);
+    }
+
     if (syncImmediately) {
         syncCloudSave().catch(() => {});
     }
@@ -252,5 +416,9 @@ function stopCloudSync() {
     if (cloudSyncTimer !== null) {
         clearInterval(cloudSyncTimer);
         cloudSyncTimer = null;
+    }
+    if (visibilityHandler !== null) {
+        document.removeEventListener("visibilitychange", visibilityHandler);
+        visibilityHandler = null;
     }
 }
