@@ -61,6 +61,20 @@ async function bootstrap() {
         newGame();
     }
 
+    // This fork previously used the gityxs DOM translator while storing "en" in the save.
+    // Migrate that legacy setting once to Gooboo's native Simplified Chinese locale.
+    const nativeChineseMigrationKey = 'goobooNativeZhHansV1';
+    if (!localStorage.getItem(nativeChineseMigrationKey)) {
+        if (store.state.system.settings.general.items.lang.value === 'en') {
+            store.dispatch('system/updateSetting', {
+                category: 'general',
+                name: 'lang',
+                value: 'zhHans'
+            });
+        }
+        localStorage.setItem(nativeChineseMigrationKey, '1');
+    }
+
     new Vue({
         vuetify,
         store,
